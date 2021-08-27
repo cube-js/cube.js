@@ -28,7 +28,7 @@ cube('MyCube', {
 All joins are generated as `LEFT JOIN`. The cube which defines the join serves
 as a main table, and any cubes referenced inside the `joins` property are used
 in the `LEFT JOIN` clause. Learn more about direction of joins
-[here][ref-schema-advanced-join-direction].
+[here][ref-schema-fundamentals-join-dir].
 
 The semantics of `INNER JOIN` can be achieved with additional filtering. For
 example, a simple check of whether the column value `IS NOT NULL` by using [set
@@ -49,7 +49,7 @@ Cube.js to accurately calculate measures.
 | entity in a join, all others would be right. That means that all rows of the
 | left cube are selected, while rows of the right depend on the condition.
 | For more information and specific examples, please read about [join directions
-| here][ref-schema-advanced-join-direction].
+| here][ref-schema-fundamentals-join-dir].
 <!-- prettier-ignore-end -->
 
 The three possible values for a relationship are:
@@ -278,6 +278,7 @@ Joins `A-B` and `B-C` will be resolved automatically. Cube.js uses [Dijkstra
 algorithm][wiki-djikstra-alg] to find join path between cubes given requested
 members.
 
-[ref-schema-advanced-join-direction]: /direction-of-joins
+[ref-schema-fundamentals-join-dir]:
+  /schema/fundamentals/joins#directions-of-joins
 [ref-restapi-query-filter-op-set]: query-format#filters-operators-set
 [wiki-djikstra-alg]: https://en.wikipedia.org/wiki/Dijkstra%27s_algorithm
