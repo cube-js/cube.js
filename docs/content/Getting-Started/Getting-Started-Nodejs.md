@@ -207,7 +207,7 @@ export default () => {
 Import `cubejs` and `QueryRenderer` components, and use them to fetch the data.
 In the example below, we use `vue-chartkick` to visualize data.
 
-```vue
+```javascript
 <template>
   <div class="hello">
     <query-renderer :cubejs-api="cubejsApi" :query="query">

@@ -60,7 +60,7 @@ functionality.
 | writes to the export bucket in S3.
 <!-- prettier-ignore-end -->
 
-```dotenv
+```bash
 CUBEJS_DB_EXPORT_BUCKET_TYPE=s3
 CUBEJS_DB_EXPORT_BUCKET=my.bucket.on.s3
 CUBEJS_DB_EXPORT_BUCKET_AWS_KEY=<AWS_KEY>
@@ -82,7 +82,7 @@ Snowflake][snowflake-docs-gcs-integration]. Take note of the integration name
 
 Once the Snowflake integration is set up, configure Cube.js using the following:
 
-```dotenv
+```bash
 CUBEJS_DB_EXPORT_BUCKET=snowflake-export-bucket
 CUBEJS_DB_EXPORT_BUCKET_TYPE=gcp
 CUBEJS_DB_EXPORT_GCS_CREDENTIALS=<BASE64_ENCODED_SERVICE_CREDENTIALS_JSON>

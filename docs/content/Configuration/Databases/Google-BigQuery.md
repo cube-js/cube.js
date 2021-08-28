@@ -36,7 +36,7 @@ CUBEJS_DB_BQ_LOCATION=us-central1
 You could also encode the key file using Base64 and set the result to
 `CUBEJS_DB_BQ_CREDENTIALS`:
 
-```dotenv
+```bash
 CUBEJS_DB_BQ_CREDENTIALS=$(cat /path/to/my/keyfile.json | base64)
 ```
 
@@ -75,7 +75,7 @@ configuring Cube.js with the following environment variables:
 | role to your BigQuery credentials (`CUBEJS_DB_EXPORT_GCS_CREDENTIALS`).
 <!-- prettier-ignore-end -->
 
-```dotenv
+```bash
 CUBEJS_DB_EXPORT_BUCKET=export_data_58148478376
 CUBEJS_DB_EXPORT_BUCKET_TYPE=gcp
 CUBEJS_DB_EXPORT_GCS_CREDENTIALS=<BASE64_ENCODED_SERVICE_CREDENTIALS_JSON>

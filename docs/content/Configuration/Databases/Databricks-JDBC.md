@@ -15,7 +15,7 @@ permalink: /config/databases/jdbc/databricks
 
 Add the following to a `.env` file in your Cube.js project:
 
-```dotenv
+```bash
 CUBEJS_DB_TYPE=databricks-jdbc
 # CUBEJS_DB_NAME is optional
 CUBEJS_DB_NAME=default

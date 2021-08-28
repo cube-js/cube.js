@@ -69,7 +69,7 @@ configuring Cube.js with the following environment variables:
 | writes to the export bucket in S3.
 <!-- prettier-ignore-end -->
 
-```dotenv
+```bash
 CUBEJS_DB_EXPORT_BUCKET_TYPE=s3
 CUBEJS_DB_EXPORT_BUCKET=my.bucket.on.s3
 CUBEJS_DB_EXPORT_BUCKET_AWS_KEY=<AWS_KEY>

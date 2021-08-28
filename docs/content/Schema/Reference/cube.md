@@ -94,7 +94,7 @@ cube(`Users`, {
 });
 
 cube(`Contacts`, {
-  sql: `select * from contacts`
+  sql: `select * from contacts`,
 
   // primary key
   ...
@@ -105,9 +105,9 @@ Referencing a foreign cube in the `sql` parameter instructs Cube.js to build an
 implicit join to this cube. Using the schema above, we'll use a query as an
 example:
 
-```jsom
+```json
 {
-  "dimensions": ["Users.name"];
+  "dimensions": ["Users.name"]
 }
 ```
 

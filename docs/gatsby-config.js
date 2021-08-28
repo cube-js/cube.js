@@ -69,6 +69,13 @@ const config = {
               wrapperStyle: 'margin-bottom: 24px'
             }
           },
+          {
+            resolve: `gatsby-remark-prismjs`,
+            options: {
+              inlineCodeMarker: null,
+              noInlineHighlight: true,
+            },
+          },
           `gatsby-remark-mathjax-ssr`,
           {
             resolve: 'gatsby-remark-find-replace',
