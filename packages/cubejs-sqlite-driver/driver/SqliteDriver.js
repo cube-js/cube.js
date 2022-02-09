@@ -33,40 +33,49 @@ class SqliteDriver extends BaseDriver {
 
   informationSchemaQuery() {
     return `
-      SELECT name, sql
-      FROM sqlite_master
-      WHERE type='table'
-      AND name!='sqlite_sequence'
-      ORDER BY name
+      WITH column_schema
+           AS (SELECT m.name AS table_name,
+                      p.name AS column_name,
+                      CASE
+                        WHEN UPPER(p.type) LIKE '%INT%' THEN 'bigint'
+                        WHEN UPPER(p.type) LIKE '%CHAR%' THEN 'text'
+                        WHEN UPPER(p.type) LIKE '%CLOB%' THEN 'text'
+                        WHEN UPPER(p.type) LIKE '%TEXT%' THEN 'text'
+                        WHEN UPPER(p.type) LIKE '%BLOB%' THEN 'blob'
+                        WHEN UPPER(p.type) LIKE '%REAL%' THEN 'double'
+                        WHEN UPPER(p.type) LIKE '%FLOA%' THEN 'double'
+                        WHEN UPPER(p.type) LIKE '%DOUB%' THEN 'double'
+                        ELSE 'double'
+                      END AS column_type
+                 FROM sqlite_master AS m
+                 JOIN pragma_table_info(m.name) AS p
+                WHERE m.name NOT IN ('sqlite_sequence', 'sqlite_stat1')
+                      AND m.type IN ('table', 'view')
+                ORDER BY m.name, p.cid
+              ),
+           table_schema
+           AS (SELECT table_name,
+                      JSON_GROUP_ARRAY(JSON_OBJECT('name', column_name, 'type', column_type)) AS columns_as_json
+                 FROM column_schema
+                GROUP BY table_name
+                ORDER BY table_name
+              )
+      SELECT JSON_GROUP_OBJECT(table_name, JSON(columns_as_json)) AS schema_as_json
+        FROM table_schema
    `;
   }
 
   async tablesSchema() {
     const query = this.informationSchemaQuery();
-
     const tables = await this.query(query);
 
-    return {
-      main: tables.reduce((acc, table) => ({
-        ...acc,
-        [table.name]: table.sql
-          // remove EOL for next .match to read full string
-          .replace(/\n/g, '')
-          // extract fields
-          .match(/\((.*)\)/)[1]
-          // split fields
-          .split(',')
-          .map((nameAndType) => {
-            const match = nameAndType
-              .trim()
-              // replace \t with whitespace
-              .replace(/\t/g, ' ')
-              // obtain "([|`|")?name(]|`|")? type"
-              .match(/([|`|"])?([^[\]"`]+)(]|`|")?\s+(\w+)/);
-            return { name: match[2], type: match[4] };
-          })
-      }), {}),
-    };
+    if (tables.length === 1 && Object.prototype.hasOwnProperty.call(tables[0], 'schema_as_json')) {
+      return {
+        main: JSON.parse(tables[0].schema_as_json)
+      };
+    } else {
+      throw new Error('Unable to extract schema from SQLite database.', JSON.stringify(tables));
+    }
   }
 
   createSchemaIfNotExists(schemaName) {
@@ -87,7 +96,7 @@ class SqliteDriver extends BaseDriver {
     if (!attachedDatabases.find(s => s.name === schemaName)) {
       return [];
     }
-    return this.query(`SELECT name as table_name FROM ${schemaName}.sqlite_master WHERE type='table' ORDER BY name`);
+    return this.query(`SELECT name AS table_name FROM ${schemaName}.sqlite_master WHERE type = 'table' ORDER BY name`);
   }
 }
 
