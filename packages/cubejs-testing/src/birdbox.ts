@@ -401,6 +401,16 @@ export async function startBirdBoxFromCli(
     path.join(testDir, 'dbt-project')
   );
 
+  fs.copySync(
+    path.join('birdbox-fixtures', 'driver-test-data', 'CAST.js'),
+    path.join('birdbox-test-project', 'schema', 'CAST.js'),
+  );
+
+  fs.copySync(
+    path.join('birdbox-fixtures', 'common', 'env.js'),
+    path.join('birdbox-test-project', 'env.js'),
+  );
+
   if (options.schemaDir) {
     fs.copySync(
       path.join(process.cwd(), 'birdbox-fixtures', options.schemaDir),

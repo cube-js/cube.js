@@ -20,6 +20,7 @@ export const DB_CAST = {
     SELECT_SUFFIX: ')\nselect * from tmp_tbl',
   },
 };
+
 export const DATE_CAST = {
   athena: {
     DATE_PREFIX: 'date_parse(',
@@ -27,6 +28,13 @@ export const DATE_CAST = {
   },
   bigquery: {
     DATE_PREFIX: 'parse_date(\'%Y-%m-%d\', ',
+    DATE_SUFFIX: ')',
+  },
+  // The default range queries for `refreshKey: every '...'` use `DATETIME(timestamp, tz)`.
+  // parse_date returns a DATE instead of a TIMESTAMP, and refresh queries fail with
+  // "Error: Could not cast literal "UTC" to type TIME"
+  bigquery2: {
+    DATE_PREFIX: 'parse_timestamp(\'%Y-%m-%d\', ',
     DATE_SUFFIX: ')',
   },
   firebolt: {
