@@ -52,7 +52,10 @@ use super::information_schema::postgres::{
     PgCatalogTableProvider, PgCatalogTypeProvider,
 };
 
-use super::information_schema::redshift::RedshiftSvvTablesTableProvider;
+use super::information_schema::redshift::{
+    RedshiftLateBindingViewUnpackedTableProvider, RedshiftSvvExternalSchemasTableProvider,
+    RedshiftSvvTablesTableProvider,
+};
 
 #[derive(Clone)]
 pub struct CubeContext {
@@ -131,6 +134,7 @@ impl DatabaseProtocol {
         match self {
             DatabaseProtocol::MySQL => self.get_mysql_provider(context, tr),
             DatabaseProtocol::PostgreSQL => self.get_postgres_provider(context, tr),
+            DatabaseProtocol::Redshift => self.get_redshift_provider(context, tr),
         }
     }
 
@@ -141,6 +145,7 @@ impl DatabaseProtocol {
         match self {
             DatabaseProtocol::MySQL => self.get_mysql_table_name(table_provider),
             DatabaseProtocol::PostgreSQL => self.get_postgres_table_name(table_provider),
+            DatabaseProtocol::Redshift => self.get_postgres_table_name(table_provider),
         }
     }
 
@@ -326,6 +331,10 @@ impl DatabaseProtocol {
             "pg_catalog.pg_sequence".to_string()
         } else if let Some(_) = any.downcast_ref::<RedshiftSvvTablesTableProvider>() {
             "public.svv_tables".to_string()
+        } else if let Some(_) = any.downcast_ref::<RedshiftSvvExternalSchemasTableProvider>() {
+            "public.svv_external_schemas".to_string()
+        } else if let Some(_) = any.downcast_ref::<RedshiftLateBindingViewUnpackedTableProvider>() {
+            "public.get_late_binding_view_cols_unpacked".to_string()
         } else if let Some(_) = any.downcast_ref::<PostgresSchemaConstraintColumnUsageProvider>() {
             "information_schema.constraint_column_usage".to_string()
         } else if let Some(_) = any.downcast_ref::<PostgresSchemaViewsProvider>() {
@@ -342,12 +351,11 @@ impl DatabaseProtocol {
         })
     }
 
-    fn get_postgres_provider(
+    fn extract_postgres_path_from_table_reference(
         &self,
-        context: &CubeContext,
         tr: datafusion::catalog::TableReference,
-    ) -> Option<std::sync::Arc<dyn datasource::TableProvider>> {
-        let (_, schema, table) = match tr {
+    ) -> (String, String, String) {
+        match tr {
             datafusion::catalog::TableReference::Partial { schema, table, .. } => (
                 "db".to_string(),
                 schema.to_ascii_lowercase(),
@@ -377,7 +385,44 @@ impl DatabaseProtocol {
                     )
                 }
             }
-        };
+        }
+    }
+
+    fn get_redshift_provider(
+        &self,
+        context: &CubeContext,
+        tr: datafusion::catalog::TableReference,
+    ) -> Option<std::sync::Arc<dyn datasource::TableProvider>> {
+        let (_, schema, table) = self.extract_postgres_path_from_table_reference(tr);
+
+        match schema.as_str() {
+            "public" => {
+                // Redshift
+                match table.as_str() {
+                    "svv_tables" => {
+                        return Some(Arc::new(RedshiftSvvTablesTableProvider::new(
+                            &context.meta.cubes,
+                        )))
+                    }
+                    "svv_external_schemas" => {
+                        return Some(Arc::new(RedshiftSvvExternalSchemasTableProvider::new()))
+                    }
+                    "get_late_binding_view_cols_unpacked" => {
+                        return Some(Arc::new(RedshiftLateBindingViewUnpackedTableProvider::new()))
+                    }
+                    _ => self.get_postgres_provider(context, tr)
+                }
+            },
+            _ => self.get_postgres_provider(context, tr)
+        }
+    }
+
+    fn get_postgres_provider(
+        &self,
+        context: &CubeContext,
+        tr: datafusion::catalog::TableReference,
+    ) -> Option<std::sync::Arc<dyn datasource::TableProvider>> {
+        let (_, schema, table) = self.extract_postgres_path_from_table_reference(tr);
 
         match schema.as_str() {
             "public" => {
@@ -387,19 +432,8 @@ impl DatabaseProtocol {
                     .iter()
                     .find(|c| c.name.eq_ignore_ascii_case(&table))
                 {
-                    return Some(Arc::new(CubeTableProvider::new(cube.clone())));
                     // TODO .clone()
-                };
-
-                // TODO: Move to pg_catalog, support SEARCH PATH.
-                // Redshift
-                match table.as_str() {
-                    "svv_tables" => {
-                        return Some(Arc::new(RedshiftSvvTablesTableProvider::new(
-                            &context.meta.cubes,
-                        )))
-                    }
-                    _ => {}
+                    return Some(Arc::new(CubeTableProvider::new(cube.clone())));
                 };
             }
             "information_schema" => match table.as_str() {
