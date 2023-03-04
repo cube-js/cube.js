@@ -15,8 +15,8 @@ use std::collections::HashMap;
 use std::env;
 
 use crate::metastore::{
-    BaseRocksStoreFs, DbTableRef, IdRow, MetaStoreEvent, MetaStoreFs, RocksStore,
-    RocksStoreDetails, RocksTable,
+    BaseRocksStoreFs, BatchPipe, DbTableRef, IdRow, MetaStoreEvent, MetaStoreFs, RocksStore,
+    RocksStoreDetails, RocksTable, RwLoopTx,
 };
 use crate::remotefs::LocalDirRemoteFs;
 use crate::util::WorkerLoop;
@@ -29,7 +29,9 @@ use rocksdb::{Options, DB};
 use crate::cachestore::compaction::CompactionPreloadedState;
 use crate::cachestore::listener::RocksCacheStoreListener;
 use crate::table::{Row, TableValue};
+use crate::util::aborting_join_handle::AbortingJoinHandle;
 use chrono::{DateTime, Utc};
+use datafusion::cube_ext;
 use itertools::Itertools;
 use log::trace;
 use serde_derive::{Deserialize, Serialize};
@@ -105,6 +107,8 @@ impl RocksStoreDetails for RocksCacheStoreDetails {
 pub struct RocksCacheStore {
     store: Arc<RocksStore>,
     upload_loop: Arc<WorkerLoop>,
+    queue_rw_loop_tx: RwLoopTx,
+    _queue_rw_loop_join_handle: Arc<AbortingJoinHandle<()>>,
 }
 
 impl RocksCacheStore {
@@ -135,9 +139,28 @@ impl RocksCacheStore {
     }
 
     fn new_from_store(store: Arc<RocksStore>) -> Arc<Self> {
+        let (queue_rw_loop_tx, queue_rw_loop_rx) = std::sync::mpsc::sync_channel::<
+            Box<dyn FnOnce() -> Result<(), CubeError> + Send + Sync + 'static>,
+        >(32_768);
+
+        let join_handle = cube_ext::spawn_blocking(move || loop {
+            match queue_rw_loop_rx.recv() {
+                Ok(fun) => {
+                    if let Err(e) = fun() {
+                        log::error!("Error during read write queue loop execution: {}", e);
+                    }
+                }
+                Err(_) => {
+                    return;
+                }
+            }
+        });
+
         Arc::new(Self {
             store,
             upload_loop: Arc::new(WorkerLoop::new("Cachestore upload")),
+            queue_rw_loop_tx,
+            _queue_rw_loop_join_handle: Arc::new(AbortingJoinHandle::new(join_handle)),
         })
     }
 
@@ -242,6 +265,29 @@ impl RocksCacheStore {
 }
 
 impl RocksCacheStore {
+    pub async fn write_operation_queue<F, R>(&self, f: F) -> Result<R, CubeError>
+    where
+        F: for<'a> FnOnce(DbTableRef<'a>, &'a mut BatchPipe) -> Result<R, CubeError>
+            + Send
+            + Sync
+            + 'static,
+        R: Send + Sync + 'static,
+    {
+        self.store
+            .write_operation_impl::<F, R>("queue", self.queue_rw_loop_tx.clone(), f)
+            .await
+    }
+
+    pub async fn read_operation_queue<F, R>(&self, f: F) -> Result<R, CubeError>
+    where
+        F: for<'a> FnOnce(DbTableRef<'a>) -> Result<R, CubeError> + Send + Sync + 'static,
+        R: Send + Sync + 'static,
+    {
+        self.store
+            .read_operation_impl::<F, R>("queue", self.queue_rw_loop_tx.clone(), f)
+            .await
+    }
+
     async fn lookup_queue_result(
         &self,
         key: String,
@@ -529,71 +575,67 @@ impl CacheStore for RocksCacheStore {
     }
 
     async fn queue_all(&self) -> Result<Vec<IdRow<QueueItem>>, CubeError> {
-        self.store
-            .read_operation(move |db_ref| Ok(QueueItemRocksTable::new(db_ref).all_rows()?))
+        self.read_operation_queue(move |db_ref| Ok(QueueItemRocksTable::new(db_ref).all_rows()?))
             .await
     }
 
     async fn queue_add(&self, item: QueueItem) -> Result<QueueAddResponse, CubeError> {
-        self.store
-            .write_operation(move |db_ref, batch_pipe| {
-                let queue_schema = QueueItemRocksTable::new(db_ref.clone());
-                let index_key = QueueItemIndexKey::ByPath(item.get_path());
-                let id_row_opt = queue_schema
-                    .get_single_opt_row_by_index(&index_key, &QueueItemRocksIndex::ByPath)?;
+        self.write_operation_queue(move |db_ref, batch_pipe| {
+            let queue_schema = QueueItemRocksTable::new(db_ref.clone());
+            let index_key = QueueItemIndexKey::ByPath(item.get_path());
+            let id_row_opt = queue_schema
+                .get_single_opt_row_by_index(&index_key, &QueueItemRocksIndex::ByPath)?;
 
-                let pending = Self::queue_count_by_prefix_and_status(
-                    db_ref,
-                    item.get_prefix(),
-                    QueueItemStatus::Pending,
-                )?;
+            let pending = Self::queue_count_by_prefix_and_status(
+                db_ref,
+                item.get_prefix(),
+                QueueItemStatus::Pending,
+            )?;
 
-                let added = if id_row_opt.is_none() {
-                    queue_schema.insert(item, batch_pipe)?;
+            let added = if id_row_opt.is_none() {
+                queue_schema.insert(item, batch_pipe)?;
 
-                    true
-                } else {
-                    false
-                };
+                true
+            } else {
+                false
+            };
 
-                Ok(QueueAddResponse {
-                    added,
-                    pending: if added { pending + 1 } else { pending },
-                })
+            Ok(QueueAddResponse {
+                added,
+                pending: if added { pending + 1 } else { pending },
             })
-            .await
+        })
+        .await
     }
 
     async fn queue_truncate(&self) -> Result<(), CubeError> {
-        self.store
-            .write_operation(move |db_ref, batch_pipe| {
-                let queue_item_schema = QueueItemRocksTable::new(db_ref.clone());
-                let rows = queue_item_schema.all_rows()?;
-                for row in rows.iter() {
-                    queue_item_schema.delete(row.get_id(), batch_pipe)?;
-                }
+        self.write_operation_queue(move |db_ref, batch_pipe| {
+            let queue_item_schema = QueueItemRocksTable::new(db_ref.clone());
+            let rows = queue_item_schema.all_rows()?;
+            for row in rows.iter() {
+                queue_item_schema.delete(row.get_id(), batch_pipe)?;
+            }
 
-                let queue_result_schema = QueueResultRocksTable::new(db_ref);
-                let rows = queue_result_schema.all_rows()?;
-                for row in rows.iter() {
-                    queue_result_schema.delete(row.get_id(), batch_pipe)?;
-                }
+            let queue_result_schema = QueueResultRocksTable::new(db_ref);
+            let rows = queue_result_schema.all_rows()?;
+            for row in rows.iter() {
+                queue_result_schema.delete(row.get_id(), batch_pipe)?;
+            }
 
-                Ok(())
-            })
-            .await?;
+            Ok(())
+        })
+        .await?;
 
         Ok(())
     }
 
     async fn queue_get(&self, key: String) -> Result<Option<IdRow<QueueItem>>, CubeError> {
-        self.store
-            .read_operation(move |db_ref| {
-                let queue_schema = QueueItemRocksTable::new(db_ref.clone());
-                let index_key = QueueItemIndexKey::ByPath(key);
-                queue_schema.get_single_opt_row_by_index(&index_key, &QueueItemRocksIndex::ByPath)
-            })
-            .await
+        self.read_operation_queue(move |db_ref| {
+            let queue_schema = QueueItemRocksTable::new(db_ref.clone());
+            let index_key = QueueItemIndexKey::ByPath(key);
+            queue_schema.get_single_opt_row_by_index(&index_key, &QueueItemRocksIndex::ByPath)
+        })
+        .await
     }
 
     async fn queue_to_cancel(
@@ -602,21 +644,20 @@ impl CacheStore for RocksCacheStore {
         orphaned_timeout: Option<u32>,
         heartbeat_timeout: Option<u32>,
     ) -> Result<Vec<IdRow<QueueItem>>, CubeError> {
-        self.store
-            .read_operation(move |db_ref| {
-                let queue_schema = QueueItemRocksTable::new(db_ref.clone());
-                let index_key = QueueItemIndexKey::ByPrefix(prefix);
-                let items =
-                    queue_schema.get_rows_by_index(&index_key, &QueueItemRocksIndex::ByPrefix)?;
+        self.read_operation_queue(move |db_ref| {
+            let queue_schema = QueueItemRocksTable::new(db_ref.clone());
+            let index_key = QueueItemIndexKey::ByPrefix(prefix);
+            let items =
+                queue_schema.get_rows_by_index(&index_key, &QueueItemRocksIndex::ByPrefix)?;
 
-                Ok(Self::filter_to_cancel(
-                    db_ref.start_time.clone(),
-                    items,
-                    orphaned_timeout,
-                    heartbeat_timeout,
-                ))
-            })
-            .await
+            Ok(Self::filter_to_cancel(
+                db_ref.start_time.clone(),
+                items,
+                orphaned_timeout,
+                heartbeat_timeout,
+            ))
+        })
+        .await
     }
 
     async fn queue_list(
@@ -625,72 +666,69 @@ impl CacheStore for RocksCacheStore {
         status_filter: Option<QueueItemStatus>,
         priority_sort: bool,
     ) -> Result<Vec<IdRow<QueueItem>>, CubeError> {
-        self.store
-            .read_operation(move |db_ref| {
-                let queue_schema = QueueItemRocksTable::new(db_ref.clone());
+        self.read_operation_queue(move |db_ref| {
+            let queue_schema = QueueItemRocksTable::new(db_ref.clone());
 
-                let items = if let Some(status_filter) = status_filter {
-                    let index_key = QueueItemIndexKey::ByPrefixAndStatus(prefix, status_filter);
-                    queue_schema
-                        .get_rows_by_index(&index_key, &QueueItemRocksIndex::ByPrefixAndStatus)?
-                } else {
-                    let index_key = QueueItemIndexKey::ByPrefix(prefix);
-                    queue_schema.get_rows_by_index(&index_key, &QueueItemRocksIndex::ByPrefix)?
-                };
+            let items = if let Some(status_filter) = status_filter {
+                let index_key = QueueItemIndexKey::ByPrefixAndStatus(prefix, status_filter);
+                queue_schema
+                    .get_rows_by_index(&index_key, &QueueItemRocksIndex::ByPrefixAndStatus)?
+            } else {
+                let index_key = QueueItemIndexKey::ByPrefix(prefix);
+                queue_schema.get_rows_by_index(&index_key, &QueueItemRocksIndex::ByPrefix)?
+            };
 
-                if priority_sort {
-                    Ok(items
-                        .into_iter()
-                        .sorted_by(|a, b| b.row.cmp(&a.row))
-                        .collect())
-                } else {
-                    Ok(items)
-                }
-            })
-            .await
+            if priority_sort {
+                Ok(items
+                    .into_iter()
+                    .sorted_by(|a, b| b.row.cmp(&a.row))
+                    .collect())
+            } else {
+                Ok(items)
+            }
+        })
+        .await
     }
 
     async fn queue_cancel(&self, key: String) -> Result<Option<IdRow<QueueItem>>, CubeError> {
-        self.store
-            .write_operation(move |db_ref, batch_pipe| {
-                let queue_schema = QueueItemRocksTable::new(db_ref.clone());
-                let index_key = QueueItemIndexKey::ByPath(key);
-                let id_row_opt = queue_schema
-                    .get_single_opt_row_by_index(&index_key, &QueueItemRocksIndex::ByPath)?;
+        self.write_operation_queue(move |db_ref, batch_pipe| {
+            let queue_schema = QueueItemRocksTable::new(db_ref.clone());
+            let index_key = QueueItemIndexKey::ByPath(key);
+            let id_row_opt = queue_schema
+                .get_single_opt_row_by_index(&index_key, &QueueItemRocksIndex::ByPath)?;
 
-                if let Some(id_row) = id_row_opt {
-                    Ok(Some(queue_schema.delete(id_row.get_id(), batch_pipe)?))
-                } else {
-                    Ok(None)
-                }
-            })
-            .await
+            if let Some(id_row) = id_row_opt {
+                Ok(Some(queue_schema.delete(id_row.get_id(), batch_pipe)?))
+            } else {
+                Ok(None)
+            }
+        })
+        .await
     }
 
     async fn queue_heartbeat(&self, key: String) -> Result<(), CubeError> {
-        self.store
-            .write_operation(move |db_ref, batch_pipe| {
-                let queue_schema = QueueItemRocksTable::new(db_ref.clone());
-                let index_key = QueueItemIndexKey::ByPath(key.clone());
-                let id_row_opt = queue_schema
-                    .get_single_opt_row_by_index(&index_key, &QueueItemRocksIndex::ByPath)?;
+        self.write_operation_queue(move |db_ref, batch_pipe| {
+            let queue_schema = QueueItemRocksTable::new(db_ref.clone());
+            let index_key = QueueItemIndexKey::ByPath(key.clone());
+            let id_row_opt = queue_schema
+                .get_single_opt_row_by_index(&index_key, &QueueItemRocksIndex::ByPath)?;
 
-                if let Some(id_row) = id_row_opt {
-                    let mut new = id_row.get_row().clone();
-                    new.update_heartbeat();
+            if let Some(id_row) = id_row_opt {
+                let mut new = id_row.get_row().clone();
+                new.update_heartbeat();
 
-                    queue_schema.update(id_row.id, new, id_row.get_row(), batch_pipe)?;
-                    Ok(())
-                } else {
-                    trace!(
-                        "Unable to update heartbeat for queue item with path: {}",
-                        key
-                    );
+                queue_schema.update(id_row.id, new, id_row.get_row(), batch_pipe)?;
+                Ok(())
+            } else {
+                trace!(
+                    "Unable to update heartbeat for queue item with path: {}",
+                    key
+                );
 
-                    Ok(())
-                }
-            })
-            .await
+                Ok(())
+            }
+        })
+        .await
     }
 
     async fn queue_retrieve(
@@ -698,87 +736,81 @@ impl CacheStore for RocksCacheStore {
         key: String,
         allow_concurrency: u32,
     ) -> Result<Option<IdRow<QueueItem>>, CubeError> {
-        self.store
-            .write_operation(move |db_ref, batch_pipe| {
-                let queue_schema = QueueItemRocksTable::new(db_ref.clone());
-                let index_key = QueueItemIndexKey::ByPath(key.clone());
-                let id_row_opt = queue_schema
-                    .get_single_opt_row_by_index(&index_key, &QueueItemRocksIndex::ByPath)?;
+        self.write_operation_queue(move |db_ref, batch_pipe| {
+            let queue_schema = QueueItemRocksTable::new(db_ref.clone());
+            let index_key = QueueItemIndexKey::ByPath(key.clone());
+            let id_row_opt = queue_schema
+                .get_single_opt_row_by_index(&index_key, &QueueItemRocksIndex::ByPath)?;
 
-                if let Some(id_row) = id_row_opt {
-                    if id_row.get_row().get_status() == &QueueItemStatus::Pending {
-                        let current_active = Self::queue_count_by_prefix_and_status(
-                            db_ref,
-                            id_row.get_row().get_prefix(),
-                            QueueItemStatus::Active,
-                        )?;
-                        if current_active >= (allow_concurrency as u64) {
-                            return Ok(None);
-                        }
-
-                        let mut new = id_row.get_row().clone();
-                        new.status = QueueItemStatus::Active;
-                        // It's an important to insert heartbeat, because
-                        // without that created datetime will be used for orphaned filtering
-                        new.update_heartbeat();
-
-                        let res = queue_schema.update(
-                            id_row.get_id(),
-                            new,
-                            id_row.get_row(),
-                            batch_pipe,
-                        )?;
-
-                        Ok(Some(res))
-                    } else {
-                        Ok(None)
+            if let Some(id_row) = id_row_opt {
+                if id_row.get_row().get_status() == &QueueItemStatus::Pending {
+                    let current_active = Self::queue_count_by_prefix_and_status(
+                        db_ref,
+                        id_row.get_row().get_prefix(),
+                        QueueItemStatus::Active,
+                    )?;
+                    if current_active >= (allow_concurrency as u64) {
+                        return Ok(None);
                     }
+
+                    let mut new = id_row.get_row().clone();
+                    new.status = QueueItemStatus::Active;
+                    // It's an important to insert heartbeat, because
+                    // without that created datetime will be used for orphaned filtering
+                    new.update_heartbeat();
+
+                    let res =
+                        queue_schema.update(id_row.get_id(), new, id_row.get_row(), batch_pipe)?;
+
+                    Ok(Some(res))
                 } else {
                     Ok(None)
                 }
-            })
-            .await
+            } else {
+                Ok(None)
+            }
+        })
+        .await
     }
 
     async fn queue_ack(&self, path: String, result: Option<String>) -> Result<(), CubeError> {
-        self.store
-            .write_operation(move |db_ref, batch_pipe| {
-                let queue_schema = QueueItemRocksTable::new(db_ref.clone());
-                let result_schema = QueueResultRocksTable::new(db_ref.clone());
-                let index_key = QueueItemIndexKey::ByPath(path.clone());
-                let item_row = queue_schema
-                    .get_single_opt_row_by_index(&index_key, &QueueItemRocksIndex::ByPath)?;
+        self.write_operation_queue(move |db_ref, batch_pipe| {
+            let queue_schema = QueueItemRocksTable::new(db_ref.clone());
+            let result_schema = QueueResultRocksTable::new(db_ref.clone());
+            let index_key = QueueItemIndexKey::ByPath(path.clone());
+            let item_row = queue_schema
+                .get_single_opt_row_by_index(&index_key, &QueueItemRocksIndex::ByPath)?;
 
-                if let Some(item_row) = item_row {
-                    queue_schema.delete(item_row.get_id(), batch_pipe)?;
+            if let Some(item_row) = item_row {
+                queue_schema.delete(item_row.get_id(), batch_pipe)?;
 
-                    if let Some(result) = result {
-                        let queue_result = QueueResult::new(path.clone(), result.clone());
-                        let result_row = result_schema.insert(queue_result, batch_pipe)?;
+                if let Some(result) = result {
+                    let queue_result = QueueResult::new(path.clone(), result.clone());
+                    let result_row = result_schema.insert(queue_result, batch_pipe)?;
 
-                        batch_pipe.add_event(MetaStoreEvent::AckQueueItem(QueueResultAckEvent {
-                            path,
-                            result: QueueResultAckEventResult::WithResult {
-                                row_id: result_row.get_id(),
-                                result,
-                            },
-                        }));
-                    } else {
-                        batch_pipe.add_event(MetaStoreEvent::AckQueueItem(QueueResultAckEvent {
-                            path,
-                            result: QueueResultAckEventResult::Empty {},
-                        }));
-                    }
-
-                    Ok(())
+                    batch_pipe.add_event(MetaStoreEvent::AckQueueItem(QueueResultAckEvent {
+                        path,
+                        result: QueueResultAckEventResult::WithResult {
+                            row_id: result_row.get_id(),
+                            result,
+                        },
+                    }));
                 } else {
-                    Err(CubeError::user(format!(
-                        "Unable ack queue, unknown id: {}",
-                        path
-                    )))
+                    batch_pipe.add_event(MetaStoreEvent::AckQueueItem(QueueResultAckEvent {
+                        path,
+                        result: QueueResultAckEventResult::Empty {},
+                    }));
                 }
-            })
-            .await
+
+                Ok(())
+            } else {
+                Err(CubeError::user(format!(
+                    "Unable ack queue, unknown id: {}",
+                    path
+                )))
+            }
+        })
+        .await
     }
 
     async fn queue_result(&self, key: String) -> Result<Option<QueueResultResponse>, CubeError> {
@@ -829,27 +861,26 @@ impl CacheStore for RocksCacheStore {
     }
 
     async fn queue_merge_extra(&self, key: String, payload: String) -> Result<(), CubeError> {
-        self.store
-            .write_operation(move |db_ref, batch_pipe| {
-                let queue_schema = QueueItemRocksTable::new(db_ref.clone());
-                let index_key = QueueItemIndexKey::ByPath(key.clone());
-                let id_row_opt = queue_schema
-                    .get_single_opt_row_by_index(&index_key, &QueueItemRocksIndex::ByPath)?;
+        self.write_operation_queue(move |db_ref, batch_pipe| {
+            let queue_schema = QueueItemRocksTable::new(db_ref.clone());
+            let index_key = QueueItemIndexKey::ByPath(key.clone());
+            let id_row_opt = queue_schema
+                .get_single_opt_row_by_index(&index_key, &QueueItemRocksIndex::ByPath)?;
 
-                if let Some(id_row) = id_row_opt {
-                    let new = id_row.get_row().merge_extra(payload)?;
+            if let Some(id_row) = id_row_opt {
+                let new = id_row.get_row().merge_extra(payload)?;
 
-                    queue_schema.update(id_row.id, new, id_row.get_row(), batch_pipe)?;
+                queue_schema.update(id_row.id, new, id_row.get_row(), batch_pipe)?;
 
-                    Ok(())
-                } else {
-                    Err(CubeError::user(format!(
-                        "Unable to find queue with id: {}",
-                        key
-                    )))
-                }
-            })
-            .await
+                Ok(())
+            } else {
+                Err(CubeError::user(format!(
+                    "Unable to find queue with id: {}",
+                    key
+                )))
+            }
+        })
+        .await
     }
 
     async fn compaction(&self) -> Result<(), CubeError> {
@@ -868,12 +899,19 @@ impl CacheStore for RocksCacheStore {
     }
 
     async fn healthcheck(&self) -> Result<(), CubeError> {
-        self.store
-            .read_operation(move |_| {
-                // read_operation will call getSnapshot, which is enough to test that RocksDB works
-                Ok(())
-            })
-            .await?;
+        let f1 = self.store.read_operation(move |_| {
+            // read_operation will call getSnapshot, which is enough to test that RocksDB works
+            Ok(())
+        });
+
+        let f2 = self.store.read_operation(move |_| {
+            // read_operation will call getSnapshot, which is enough to test that RocksDB works
+            Ok(())
+        });
+
+        let (r1, r2) = tokio::join!(f1, f2);
+        r1?;
+        r2?;
 
         Ok(())
     }

@@ -499,6 +499,9 @@ pub trait RocksStoreDetails: Send + Sync {
     fn get_name(&self) -> &'static str;
 }
 
+pub type RwLoopTx =
+    std::sync::mpsc::SyncSender<Box<dyn FnOnce() -> Result<(), CubeError> + Send + Sync + 'static>>;
+
 #[derive(Clone)]
 pub struct RocksStore {
     pub db: Arc<DB>,
@@ -514,9 +517,7 @@ pub struct RocksStore {
     snapshot_uploaded: Arc<RwLock<bool>>,
     snapshots_upload_stopped: Arc<AsyncMutex<bool>>,
     pub(crate) cached_tables: Arc<Mutex<Option<Arc<Vec<TablePath>>>>>,
-    rw_loop_tx: std::sync::mpsc::SyncSender<
-        Box<dyn FnOnce() -> Result<(), CubeError> + Send + Sync + 'static>,
-    >,
+    rw_loop_tx: RwLoopTx,
     _rw_loop_join_handle: Arc<AbortingJoinHandle<()>>,
     details: Arc<dyn RocksStoreDetails>,
 }
@@ -666,13 +667,29 @@ impl RocksStore {
             + 'static,
         R: Send + Sync + 'static,
     {
+        self.write_operation_impl::<F, R>("default", self.rw_loop_tx.clone(), f)
+            .await
+    }
+
+    pub async fn write_operation_impl<F, R>(
+        &self,
+        loop_name: &'static str,
+        rw_loop_sender: RwLoopTx,
+        f: F,
+    ) -> Result<R, CubeError>
+    where
+        F: for<'a> FnOnce(DbTableRef<'a>, &'a mut BatchPipe) -> Result<R, CubeError>
+            + Send
+            + Sync
+            + 'static,
+        R: Send + Sync + 'static,
+    {
         let db = self.db.clone();
         let mem_seq = MemorySequence::new(self.seq_store.clone());
         let db_to_send = db.clone();
         let cached_tables = self.cached_tables.clone();
         let store_name = self.details.get_name();
 
-        let rw_loop_sender = self.rw_loop_tx.clone();
         let (tx, rx) = oneshot::channel::<Result<(R, Vec<MetaStoreEvent>), CubeError>>();
 
         cube_ext::spawn_blocking(move || {
@@ -698,16 +715,16 @@ impl RocksStore {
                         let write_result = batch.batch_write_rows()?;
                         tx.send(Ok((res, write_result))).map_err(|_| {
                             CubeError::internal(format!(
-                                "[{}] Write operation result receiver has been dropped",
-                                store_name
+                                "[{}-{}] Write operation result receiver has been dropped",
+                                store_name, loop_name
                             ))
                         })?;
                     }
                     Err(e) => {
                         tx.send(Err(e)).map_err(|_| {
                             CubeError::internal(format!(
-                                "[{}] Write operation result receiver has been dropped",
-                                store_name
+                                "[{}-{}] Write operation result receiver has been dropped",
+                                store_name, loop_name
                             ))
                         })?;
                     }
@@ -867,16 +884,29 @@ impl RocksStore {
         F: for<'a> FnOnce(DbTableRef<'a>) -> Result<R, CubeError> + Send + Sync + 'static,
         R: Send + Sync + 'static,
     {
+        self.read_operation_impl::<F, R>("default", self.rw_loop_tx.clone(), f)
+            .await
+    }
+
+    pub async fn read_operation_impl<F, R>(
+        &self,
+        loop_name: &'static str,
+        rw_loop_sender: RwLoopTx,
+        f: F,
+    ) -> Result<R, CubeError>
+    where
+        F: for<'a> FnOnce(DbTableRef<'a>) -> Result<R, CubeError> + Send + Sync + 'static,
+        R: Send + Sync + 'static,
+    {
         let mem_seq = MemorySequence::new(self.seq_store.clone());
         let db_to_send = self.db.clone();
         let store_name = self.details.get_name();
 
-        let rw_loop_sender = self.rw_loop_tx.clone();
         let (tx, rx) = oneshot::channel::<Result<R, CubeError>>();
 
         cube_ext::spawn_blocking(move || {
             let res = rw_loop_sender.send(Box::new(move || {
-                let db_span = warn_long("metastore read operation", Duration::from_millis(100));
+                let db_span = warn_long("store read operation", Duration::from_millis(100));
 
                 let snapshot = db_to_send.snapshot();
                 let res = f(DbTableRef {
@@ -888,8 +918,8 @@ impl RocksStore {
 
                 tx.send(res).map_err(|_| {
                     CubeError::internal(format!(
-                        "[{}] Read operation result receiver has been dropped",
-                        store_name
+                        "[{}-{}] Read operation result receiver has been dropped",
+                        store_name, loop_name
                     ))
                 })?;
 
@@ -916,10 +946,10 @@ impl RocksStore {
 
         cube_ext::spawn_blocking(move || {
             let db_span = warn_long(
-                "metastore read operation out of queue",
+                "store read operation out of queue",
                 Duration::from_millis(100),
             );
-            let span = tracing::trace_span!("metastore read operation out of queue");
+            let span = tracing::trace_span!("store read operation out of queue");
             let span_holder = span.enter();
 
             let snapshot = db_to_send.snapshot();
