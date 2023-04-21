@@ -1249,6 +1249,19 @@ const variables: Record<string, (...args: any) => any> = {
   ),
 
   /**
+   * Snowflake role.
+   */
+  snowflakeSchema: ({
+                    dataSource
+                  }: {
+    dataSource: string,
+  }) => (
+    process.env[
+      keyByDataSource('CUBEJS_DB_SNOWFLAKE_SCHEMA', dataSource)
+      ]
+  ),
+
+  /**
    * Snowflake session keep alive flag.
    */
   snowflakeSessionKeepAlive: ({
