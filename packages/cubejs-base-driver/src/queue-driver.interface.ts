@@ -86,7 +86,7 @@ export interface QueueDriverConnectionInterface {
   // Trying to acquire a lock for processing a queue item, this method can return null when
   // multiple nodes tries to process the same query
   retrieveForProcessing(hash: QueryKeyHash, processingId: ProcessingId): Promise<RetrieveForProcessingResponse>;
-  freeProcessingLock(hash: QueryKeyHash, processingId: ProcessingId, activated: unknown): Promise<void>;
+  freeProcessingLock(hash: QueryKeyHash, processingId: ProcessingId, activated: unknown): Promise<void | string>;
   optimisticQueryUpdate(hash: QueryKeyHash, toUpdate: unknown, processingId: ProcessingId, queueId: QueueId | null): Promise<boolean>;
   cancelQuery(queryKey: QueryKey): Promise<QueryDef | null>;
   getQueryAndRemove(hash: QueryKeyHash): Promise<[QueryDef]>;

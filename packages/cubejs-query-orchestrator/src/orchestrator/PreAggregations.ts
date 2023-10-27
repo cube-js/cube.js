@@ -865,7 +865,7 @@ export class PreAggregationLoader {
     const queue = await this.preAggregations.getQueue(this.preAggregation.dataSource);
     return queue.executeInQueue(
       'query',
-      this.preAggregationQueryKey(invalidationKeys),
+      <any> this.preAggregationQueryKey(invalidationKeys),
       {
         preAggregation: this.preAggregation,
         preAggregationsTablesToTempTables: this.preAggregationsTablesToTempTables,
@@ -2061,7 +2061,7 @@ export class PreAggregations {
     tables = tables.filter(row => `${schema}.${row.table_name}` === table);
 
     // fetching query result
-    const { queueDriver } = this.queue[dataSource];
+    const queueDriver = this.queue[dataSource].getQueueDriver();
     const conn = await queueDriver.createConnection();
     const result = await conn.getResult(key);
     queueDriver.release(conn);

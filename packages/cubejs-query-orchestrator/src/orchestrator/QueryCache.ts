@@ -468,7 +468,7 @@ export class QueryCache {
     };
 
     if (!persistent) {
-      return queue.executeInQueue('query', cacheKey, _query, priority, opt);
+      return queue.executeInQueue('query', cacheKey as any, _query, priority, opt);
     } else {
       return queue.executeInQueue('stream', cacheKey, {
         ..._query,
@@ -636,11 +636,11 @@ export class QueryCache {
                 source.once('end', () => cleanup(undefined));
                 source.once('error', cleanup);
                 source.once('close', () => cleanup(undefined));
-      
+
                 target.once('end', () => cleanup(undefined));
                 target.once('error', cleanup);
                 target.once('close', () => cleanup(undefined));
-      
+
                 source.pipe(target);
               })
               .catch((reason) => {
