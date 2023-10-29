@@ -111,6 +111,9 @@
     },
     {
       "path": "packages/cubejs-dbt-schema-extension"
+    },
+    {
+      "path": "packages/cubejs-cockroach-driver"
     }
   ]
 }
