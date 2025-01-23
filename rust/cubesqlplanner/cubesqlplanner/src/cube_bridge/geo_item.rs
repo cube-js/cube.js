@@ -9,9 +9,7 @@ use std::any::Any;
 use std::rc::Rc;
 
 #[nativebridge::native_bridge]
-pub trait MemberOrderBy {
+pub trait GeoItem {
     #[field]
     fn sql(&self) -> Result<Rc<dyn MemberSql>, CubeError>;
-    #[field]
-    fn dir(&self) -> Result<String, CubeError>;
 }
