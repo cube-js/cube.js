@@ -71,7 +71,7 @@ class DremioQuery extends BaseQuery {
   }
 
   escapeColumnName(name) {
-    return `"${name}"`;
+    return `"${name.replaceAll('"', '""')}"`;
   }
 
   seriesSql(timeDimension) {
