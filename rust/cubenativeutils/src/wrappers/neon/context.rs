@@ -5,12 +5,13 @@ use super::object::neon_array::NeonArray;
 use super::object::neon_function::NeonFunction;
 use super::object::neon_struct::NeonStruct;
 use super::object::NeonObject;
-use crate::wrappers::context::NativeContext;
+use crate::wrappers::context::{NativeContext, NativeContextHolder};
 use crate::wrappers::object::NativeObject;
 use crate::wrappers::object_handle::NativeObjectHandle;
 use cubesql::CubeError;
 use neon::prelude::*;
-use std::cell::RefCell;
+use std::cell::{RefCell, RefMut};
+use std::marker::PhantomData;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::rc::{Rc, Weak};
 
@@ -47,18 +48,42 @@ impl<C: Context<'static>> ContextWrapper<C> {
     }
 }
 
+pub struct NeonContextGuard<'cx, C: Context<'cx> + NoenContextLifetimeExpand<'cx>> {
+    context: Rc<RefCell<ContextWrapper<C::ExpandedResult>>>,
+    lifetime: PhantomData<&'cx ()>,
+}
+
+impl<'cx, C: Context<'cx> + NoenContextLifetimeExpand<'cx> + 'cx> NeonContextGuard<'cx, C> {
+    fn new(cx: C) -> Self {
+        Self {
+            context: ContextWrapper::new(cx.expand_lifetime()),
+            lifetime: PhantomData::default(),
+        }
+    }
+
+    fn context_holder(&self) -> ContextHolder<C::ExpandedResult> {
+        ContextHolder::new(Rc::downgrade(&self.context))
+    }
+
+    fn unwrap(self) {
+        if Rc::strong_count(&self.context) > 0 {
+            match Rc::try_unwrap(self.context) {
+                Ok(_) => {}
+                Err(_) => panic!("Guarded context have more then one reference"),
+            }
+        }
+    }
+}
+
 pub fn neon_run_with_guarded_lifetime<'cx, C, T, F>(cx: C, func: F) -> T
 where
-    C: Context<'cx> + NoenContextLifetimeExpand<'cx>,
+    C: Context<'cx> + NoenContextLifetimeExpand<'cx> + 'cx,
     F: FnOnce(ContextHolder<C::ExpandedResult>) -> T,
 {
-    let context = ContextWrapper::new(cx.expand_lifetime());
-    let context_holder = ContextHolder::new(Rc::downgrade(&context));
+    let guard = NeonContextGuard::new(cx);
+    let context_holder = guard.context_holder();
     let res = catch_unwind(AssertUnwindSafe(|| func(context_holder)));
-    match Rc::try_unwrap(context) {
-        Ok(_) => {}
-        Err(_) => panic!("Guarded context have more then one reference"),
-    };
+    guard.unwrap();
 
     match res {
         Ok(res) => res,
