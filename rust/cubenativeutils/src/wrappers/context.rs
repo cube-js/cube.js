@@ -1,4 +1,5 @@
 use super::inner_types::InnerTypes;
+use super::object::NativeBox;
 use super::object_handle::NativeObjectHandle;
 
 pub trait NativeContext<IT: InnerTypes>: Clone {
@@ -8,6 +9,7 @@ pub trait NativeContext<IT: InnerTypes>: Clone {
     fn undefined(&self) -> NativeObjectHandle<IT>;
     fn empty_array(&self) -> IT::Array;
     fn empty_struct(&self) -> IT::Struct;
+    //fn boxed<T: 'static>(&self, value: T) -> impl NativeBox<IT, T>;
     fn to_string_fn(&self, result: String) -> IT::Function;
 }
 

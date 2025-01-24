@@ -1,3 +1,5 @@
+use std::ops::Deref;
+
 use super::inner_types::InnerTypes;
 use super::object_handle::NativeObjectHandle;
 use cubesql::CubeError;
@@ -56,4 +58,8 @@ pub trait NativeNumber<IT: InnerTypes>: NativeType<IT> {
 
 pub trait NativeBoolean<IT: InnerTypes>: NativeType<IT> {
     fn value(&self) -> Result<bool, CubeError>;
+}
+
+pub trait NativeBox<IT: InnerTypes, T: 'static>: NativeType<IT> {
+    fn deref_value(&self) -> &T;
 }
